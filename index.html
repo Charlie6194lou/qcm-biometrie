@@ -1360,12 +1360,12 @@ $("whoForm").addEventListener("submit", function(e){
   if(!classId){
     var code = $("whoClass").value.trim();
     if(code){
-      var id = codeToId(code);
-      if(!id){ whoErr("Ce code de classe n'existe pas. Vérifie chaque lettre."); $("whoClass").focus(); return; }
-      classId = id;
+      code = cleanCode(code);
+      if(!/^[A-Z2-9]{4,8}$/.test(code)){ whoErr("Ce code de classe n'existe pas. Vérifie chaque lettre."); $("whoClass").focus(); return; }
+      classId = code;
     }else if(role === "prof"){
       created = true;
-      p = cfetch("POST", "", { app:"qcm-biometrie", v:1, created:Date.now(), users:{} }).then(function(id){ classId = id; });
+      p = cloudCreateClass(name);
     }else{ whoErr("Tape le code de la classe que le prof a écrit au tableau."); $("whoClass").focus(); return; }
   }
   whoBusy(true);
@@ -1399,7 +1399,7 @@ function renderHome(){
   if(CLOUD){
     $("whoClass").hidden = !!classId;
     $("whoClassLine").hidden = !classId;
-    if(classId) $("whoClassCode").textContent = idToCode(classId);
+    if(classId) $("whoClassCode").textContent = classId;
     $("whoHelp").textContent = fr(classId
       ? "Première fois ici ? Écris ton prénom et choisis un code PIN à 4 chiffres : ton compte est créé. Ensuite, retape-les pour te reconnecter, même sur un autre appareil."
       : "Élève : tape le code de la classe écrit au tableau. Prof : laisse le code vide, ton compte prof crée la classe.");
@@ -2735,29 +2735,15 @@ $("endNew").addEventListener("click", function(){ G = null; saveG(); renderClass
 $("endHome").addEventListener("click", function(){ G = null; saveG(); show("home"); });
 
 /* ---------- comptes en ligne (site hébergé) : une classe, des élèves, un prof, les résultats en direct ---------- */
-/* ponytail: une seule « base » JSON par classe (jsonblob), dernier écrivain gagnant + relecture ; pas de mot de passe prof. */
+/* ponytail: Firebase Realtime Database en REST, sans SDK ; code de classe = clé ; PIN haché côté client (brute-forçable : c'est un quiz, pas une banque). */
 var CLOUD = /github\.io$/i.test(location.hostname) || !!window.QCM_CLOUD_TEST;
-var CLOUD_API = "https://jsonblob.com/api/jsonBlob";
+var CLOUD_API = "https://qcm-biometrie-default-rtdb.firebaseio.com/classes/";
 var KEY_CLASS = "qcm-biometrie-classe-id-v1";
-function savedClassId(){ var v = lsGet(KEY_CLASS) || ""; return /^\d{6,30}$/.test(v) ? v : ""; }
+function savedClassId(){ var v = lsGet(KEY_CLASS) || ""; return /^[A-Z2-9]{4,8}$/.test(v) ? v : ""; }
 var classId = savedClassId(), classCache = null, cloudSelCode = "";
-function idToCode(id){
-  if(typeof BigInt !== "function") return id;
-  try{ var n = BigInt(id), b = BigInt(32), z = BigInt(0), out = ""; while(n > z){ out = B32.charAt(Number(n % b)) + out; n = n / b; } return out || "A"; }catch(e){ return id; }
-}
-function codeToId(code){
-  code = cleanCode(code);
-  if(/^\d{15,30}$/.test(code)) return code;
-  if(typeof BigInt !== "function" || code.length < 4 || code.length > 20) return "";
-  try{
-    var n = BigInt(0), b = BigInt(32);
-    for(var i = 0; i < code.length; i++){ var k = B32.indexOf(code.charAt(i)); if(k < 0) return ""; n = n * b + BigInt(k); }
-    var s = n.toString();
-    return /^\d{6,30}$/.test(s) ? s : "";
-  }catch(e){ return ""; }
-}
-function classLink(){ return location.href.split("#")[0] + "#classe-" + idToCode(classId); }
-function userKey(name){ return String(name).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]+/g, " ").trim(); }
+function genClassCode(){ var s = ""; for(var i = 0; i < 5; i++) s += B32.charAt(Math.floor(Math.random() * 32)); return s; }
+function classLink(){ return location.href.split("#")[0] + "#classe-" + classId; }
+function userKey(name){ return String(name).toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]+/g, " ").trim().replace(/ /g, "-"); }
 function sha(str){
   try{
     if(window.crypto && crypto.subtle && window.TextEncoder){
@@ -2768,55 +2754,25 @@ function sha(str){
   }catch(e){}
   return Promise.resolve("h" + hash32(str).toString(36) + hash32(str + "|2").toString(36));
 }
-function wait(ms){ return new Promise(function(res){ setTimeout(res, ms); }); }
-function cfetch(method, id, body){
+/* GET / PUT / PATCH sur un chemin de la classe courante ; null = rien à cet endroit */
+function cfetch(method, path, body){
   var ac = typeof AbortController === "function" ? new AbortController() : null;
   var timer = setTimeout(function(){ if(ac) ac.abort(); }, 15000);
   var opts = { method:method, cache:"no-store" };
   if(ac) opts.signal = ac.signal;
   if(body !== undefined){ opts.headers = { "Content-Type":"application/json" }; opts.body = JSON.stringify(body); }
-  return fetch(CLOUD_API + (id ? "/" + id : ""), opts).then(function(r){
+  return fetch(CLOUD_API + classId + path + ".json", opts).then(function(r){
     clearTimeout(timer);
+    if(r.status === 401 || r.status === 403) throw new Error("denied");
     if(!r.ok) throw new Error("http" + r.status);
-    if(method === "POST"){
-      var loc = r.headers.get("Location") || r.headers.get("X-jsonblob") || "";
-      var m = loc.match(/(\d{6,})\s*$/);
-      if(!m) throw new Error("noid");
-      return m[1];
-    }
     return r.json();
   }, function(e){ clearTimeout(timer); throw new Error(e && e.name === "AbortError" ? "timeout" : "net"); });
-}
-function cleanClass(C){
-  if(!C || typeof C !== "object" || Array.isArray(C)) C = {};
-  if(!C.users || typeof C.users !== "object" || Array.isArray(C.users)) C.users = {};
-  C.app = "qcm-biometrie";
-  return C;
-}
-function cloudGet(){ return cfetch("GET", classId).then(function(C){ classCache = cleanClass(C); return classCache; }); }
-/* lit, modifie, écrit, relit : si quelqu'un a écrasé notre changement entre-temps, on recommence (3 essais) */
-function cloudUpdate(key, mut){
-  var tries = 0;
-  function attempt(){
-    return cloudGet().then(function(C){
-      mut(C);
-      var want = JSON.stringify(C.users[key] || null);
-      return cfetch("PUT", classId, C).then(cloudGet).then(function(C2){
-        if(JSON.stringify(C2.users[key] || null) === want) return C2;
-        if(++tries >= 3) throw new Error("conflict");
-        return wait(300 + Math.random() * 900).then(attempt);
-      });
-    });
-  }
-  return attempt();
 }
 function cloudErrMsg(e){
   var m = (e && e.message) || "";
   if(m === "pin") return "Mauvais code PIN pour ce prénom. Première fois ici ? Ce prénom est déjà pris : ajoute une lettre (ex. Léa M).";
-  if(m === "taken") return "Ce prénom vient d'être pris : ajoute une lettre (ex. Léa M).";
-  if(m === "http404") return "Classe introuvable : vérifie le code de la classe.";
-  if(m === "noid") return "Impossible de créer la classe depuis ce navigateur. Essaie avec Chrome ou Safari.";
-  if(m === "conflict") return "Trop de monde en même temps : réessaie.";
+  if(m === "denied") return "Refusé par le serveur : reconnecte-toi avec ton prénom et ton code PIN.";
+  if(m === "noclass") return "Classe introuvable : vérifie le code de la classe.";
   if(m === "timeout") return "Le serveur ne répond pas : vérifie ta connexion et réessaie.";
   return "Pas de connexion au serveur. Réessaie dans un instant.";
 }
@@ -2825,18 +2781,28 @@ function applyCloudProg(u){
   if(u && u.prog && typeof u.prog === "object") applyStore({ seen:u.prog.seen, errors:u.prog.errors });
   lsSet(KEY, JSON.stringify(store)); syncSettings();
 }
+function cloudCreateClass(name){
+  classId = genClassCode();
+  return cfetch("GET", "/meta").then(function(meta){
+    if(meta){ classId = genClassCode(); }
+    return cfetch("PUT", "/meta", { created:Date.now(), by:name });
+  });
+}
 function cloudLogin(name, pin, role){
   var key = userKey(name);
-  return Promise.all([cloudGet(), sha(classId + "|" + key + "|" + pin)]).then(function(r){
-    var C = r[0], hash = r[1], u = C.users[key];
-    if(u){ if(u.h !== hash) throw new Error("pin"); return u; }
-    var rec = { n:name, r:role, h:hash, t:Date.now(), prog:{ seen:store.seen, errors:store.errors } };
-    return cloudUpdate(key, function(C2){ if(C2.users[key]) throw new Error("taken"); C2.users[key] = rec; }).then(function(C2){ return C2.users[key]; });
-  }).then(function(u){
-    ME = { name:String(u.n || name), role:u.r === "prof" ? "prof" : "eleve", key:key };
-    saveMe(); lsSet(KEY_CLASS, classId);
-    applyCloudProg(u);
-    return ME;
+  return Promise.all([cfetch("GET", "/meta"), sha(classId + "|" + key + "|" + pin)]).then(function(r){
+    if(!r[0]) throw new Error("noclass");
+    var hash = r[1];
+    return cfetch("GET", "/users/" + key).then(function(u){
+      if(u){ if(u.h !== hash) throw new Error("pin"); return u; }
+      var rec = { n:name, r:role, h:hash, t:Date.now(), prog:{ seen:store.seen, errors:store.errors } };
+      return cfetch("PUT", "/users/" + key, rec).then(function(){ return rec; }, function(e){ throw new Error(e.message === "denied" ? "pin" : e.message); });
+    }).then(function(u){
+      ME = { name:String(u.n || name), role:u.r === "prof" ? "prof" : "eleve", key:key, h:hash };
+      saveMe(); lsSet(KEY_CLASS, classId);
+      applyCloudProg(u);
+      return ME;
+    });
   });
 }
 function whoErr(msg){ $("whoErr").textContent = fr(msg); $("whoErr").hidden = false; }
@@ -2844,10 +2810,10 @@ function whoBusy(on){ $("whoStatus").hidden = !on; $("whoStudent").disabled = on
 ["whoPin","whoClass"].forEach(function(id){ $(id).addEventListener("input", function(){ $("whoErr").hidden = true; }); });
 $("whoClassChange").addEventListener("click", function(){ classId = ""; lsDel(KEY_CLASS); classCache = null; renderHome(); $("whoClass").focus(); });
 function setClassFromHash(code){
-  var id = codeToId(code);
-  if(CLOUD && id && id !== classId){
+  code = cleanCode(code);
+  if(CLOUD && /^[A-Z2-9]{4,8}$/.test(code) && code !== classId){
     cloudFlush();
-    classId = id; lsSet(KEY_CLASS, id); classCache = null;
+    classId = code; lsSet(KEY_CLASS, code); classCache = null;
     if(ME && ME.key){ ME = null; lsDel(KEY_ME); store.seen = {}; store.errors = []; lsSet(KEY, JSON.stringify(store)); syncSettings(); }
   }
   show("home");
@@ -2859,42 +2825,39 @@ function cloudFlush(){
   if(cloudTimer){ clearTimeout(cloudTimer); cloudTimer = 0; }
   if(!cloudDirty || !CLOUD || !ME || !ME.key || !classId) return;
   cloudDirty = false;
-  var key = ME.key, prog = { seen:store.seen, errors:store.errors };
-  cloudUpdate(key, function(C){ var u = C.users[key]; if(!u) return; u.prog = prog; u.t = Date.now(); }).catch(function(){ cloudDirty = true; });
+  cfetch("PATCH", "/users/" + ME.key, { prog:{ seen:store.seen, errors:store.errors }, t:Date.now() }).catch(function(){ cloudDirty = true; });
 }
 document.addEventListener("visibilitychange", function(){ if(document.visibilityState === "hidden") cloudFlush(); });
-/* résultat de contrôle ou de partie : rangé dans la fiche de l'élève, le prof le voit en direct */
+/* résultat de contrôle ou de partie : rangé sous la classe, le prof le voit en direct */
 function cloudSendResult(good, n){
   var out = $("resCloud"), rank = $("resRank");
   out.hidden = true; rank.hidden = true; rank.replaceChildren();
-  if(!CLOUD || !ME || !ME.key || !classId || !S || S.sent || !(isCtrl() || isGame())) return;
+  if(!CLOUD || !ME || !ME.key || !ME.h || !classId || !S || S.sent || !(isCtrl() || isGame())) return;
   var ctrl = isCtrl(), code = S.code, key = ME.key, slot = ctrl ? "res" : "games", rec;
   if(ctrl){ var secs = Math.round((S.elapsed || 0) / 1000); rec = { g:good, n:n, s:secs, at:Date.now(), v:verifCode(code, S.name, good, n, secs) }; }
   else rec = { sc:S.score, g:good, n:n, best:S.best || 0, at:Date.now() };
+  rec.h = ME.h; rec.nm = ctrl ? S.name : ME.name;
   S.sent = true;
   out.hidden = false; out.textContent = fr("Envoi du résultat au prof…");
-  function put(C){ var u = C.users[key]; if(!u) throw new Error("nouser"); if(!u[slot] || typeof u[slot] !== "object") u[slot] = {}; u[slot][code] = rec; u.t = Date.now(); }
-  cloudUpdate(key, put).then(function(){
+  cfetch("PUT", "/" + slot + "/" + code + "/" + key, rec).then(function(){
     out.replaceChildren(fr(ctrl ? "Résultat envoyé au prof ✓" : "Score envoyé ✓ "));
     if(!ctrl){
       var btn = h("button", { type:"button", class:"plain-link", id:"rankBtn" }, "Voir le classement de la classe");
       btn.addEventListener("click", function(){
         btn.disabled = true;
-        cloudGet().then(function(C){ renderRank(rank, rankList(C, code, slot), slot, key); rank.hidden = false; btn.disabled = false; btn.textContent = "Actualiser le classement"; }, function(e){ btn.disabled = false; out.append(" " + fr(cloudErrMsg(e))); });
+        cfetch("GET", "/games/" + code).then(function(m){ renderRank(rank, rankList(m || {}, null, slot), slot, key); rank.hidden = false; btn.disabled = false; btn.textContent = "Actualiser le classement"; }, function(e){ btn.disabled = false; out.append(" " + fr(cloudErrMsg(e))); });
       });
       out.append(btn);
     }
-    setTimeout(function(){
-      cloudGet().then(function(C){ var u = C.users[key]; if(!u || !u[slot] || JSON.stringify(u[slot][code]) !== JSON.stringify(rec)) return cloudUpdate(key, put); }).catch(function(){});
-    }, 4000);
-  }, function(){
+  }, function(e){
     S.sent = false;
-    out.textContent = fr(ctrl ? "Résultat pas envoyé (pas de réseau) : montre cet écran au prof." : "Score pas envoyé (pas de réseau).");
+    out.textContent = fr(e.message === "denied" ? "Résultat refusé : déconnecte-toi (« changer ») puis reconnecte-toi avec ton code PIN." : ctrl ? "Résultat pas envoyé (pas de réseau) : montre cet écran au prof." : "Score pas envoyé (pas de réseau).");
   });
 }
-function rankList(C, code, slot){
+/* m = { uid: résultat } ; users (optionnel) pour les noms */
+function rankList(m, users, slot){
   var rows = [];
-  Object.keys(C.users).forEach(function(k){ var u = C.users[k], r = u && u[slot] && u[slot][code]; if(r && typeof r === "object") rows.push({ k:k, n:String(u.n || k), r:r }); });
+  Object.keys(m || {}).forEach(function(k){ var r = m[k]; if(r && typeof r === "object") rows.push({ k:k, n:String(r.nm || (users && users[k] && users[k].n) || k), r:r }); });
   rows.sort(slot === "games"
     ? function(a, b){ return (b.r.sc || 0) - (a.r.sc || 0) || (a.r.at || 0) - (b.r.at || 0); }
     : function(a, b){ return (b.r.g || 0) - (a.r.g || 0) || (a.r.s || 0) - (b.r.s || 0); });
@@ -2916,23 +2879,23 @@ function syncCloudBox(){
   var box = $("cloudBox"), on = CLOUD && !!classId && !!ME && ME.role === "prof";
   box.hidden = !on;
   if(!on) return;
-  $("cloudCode").textContent = idToCode(classId);
+  $("cloudCode").textContent = classId;
   $("cloudLink").textContent = classLink();
   if(box.open) cloudRefresh();
 }
 function cloudRefresh(){
   if($("cloudBox").hidden || !classId) return;
   if(!classCache) $("cloudStatus").textContent = "Chargement…";
-  cloudGet().then(renderCloud, function(e){ $("cloudStatus").textContent = fr(cloudErrMsg(e)); });
+  cfetch("GET", "").then(function(C){ classCache = C || {}; renderCloud(classCache); }, function(e){ $("cloudStatus").textContent = fr(cloudErrMsg(e)); });
 }
 function renderCloud(C){
-  var users = Object.keys(C.users), codes = {};
-  users.forEach(function(k){
-    var u = C.users[k];
-    ["res","games"].forEach(function(slot){
-      var o = u && u[slot];
-      if(!o || typeof o !== "object") return;
-      Object.keys(o).forEach(function(code){ var at = (o[code] && o[code].at) || 0; if(!codes[code] || at > codes[code].at) codes[code] = { slot:slot, at:at }; });
+  var users = C.users || {}, names = Object.keys(users), codes = {};
+  ["res","games"].forEach(function(slot){
+    var o = C[slot];
+    if(!o || typeof o !== "object") return;
+    Object.keys(o).forEach(function(code){
+      var at = 0; Object.keys(o[code] || {}).forEach(function(k){ var r = o[code][k]; if(r && r.at > at) at = r.at; });
+      codes[code] = { slot:slot, at:at };
     });
   });
   var list = Object.keys(codes).sort(function(a, b){ return codes[b].at - codes[a].at; });
@@ -2940,12 +2903,12 @@ function renderCloud(C){
   var sel = $("cloudSel");
   sel.replaceChildren.apply(sel, list.map(function(code){ var o = h("option", { value:code }, fr((codes[code].slot === "res" ? "Contrôle " : "Partie ") + code)); o.selected = code === cloudSelCode; return o; }));
   $("cloudSelField").hidden = !list.length;
-  $("cloudMembers").textContent = fr(users.length
-    ? plural(users.length, "inscrit", "inscrits") + " : " + users.map(function(k){ return String(C.users[k].n || k) + (C.users[k].r === "prof" ? " (prof)" : ""); }).join(", ")
+  $("cloudMembers").textContent = fr(names.length
+    ? plural(names.length, "inscrit", "inscrits") + " : " + names.map(function(k){ return String(users[k].n || k) + (users[k].r === "prof" ? " (prof)" : ""); }).join(", ")
     : "Personne n'est encore inscrit : partage le lien de la classe.");
   var ol = $("cloudList");
-  if(!cloudSelCode){ ol.replaceChildren(); $("cloudStatus").textContent = fr(users.length ? "Pas encore de résultat : lance une partie ou un contrôle, les résultats arrivent ici tout seuls." : ""); return; }
-  var slot = codes[cloudSelCode].slot, rows = rankList(C, cloudSelCode, slot);
+  if(!cloudSelCode){ ol.replaceChildren(); $("cloudStatus").textContent = fr(names.length ? "Pas encore de résultat : lance une partie ou un contrôle, les résultats arrivent ici tout seuls." : ""); return; }
+  var slot = codes[cloudSelCode].slot, rows = rankList(C[slot][cloudSelCode], users, slot);
   renderRank(ol, rows, slot, "");
   $("cloudStatus").textContent = fr(plural(rows.length, "résultat", "résultats") + " · mis à jour à " + new Date().toLocaleTimeString("fr-BE", { hour:"2-digit", minute:"2-digit" }));
 }
@@ -2953,7 +2916,7 @@ $("cloudSel").addEventListener("change", function(){ cloudSelCode = $("cloudSel"
 $("cloudBox").addEventListener("toggle", function(){ if($("cloudBox").open) cloudRefresh(); });
 $("cloudReload").addEventListener("click", cloudRefresh);
 $("cloudCopyLink").addEventListener("click", function(){ copyText(classLink(), $("cloudLink"), $("cloudCopied")); });
-$("cloudCopyCode").addEventListener("click", function(){ copyText(idToCode(classId), $("cloudCode"), $("cloudCopied")); });
+$("cloudCopyCode").addEventListener("click", function(){ copyText(classId, $("cloudCode"), $("cloudCopied")); });
 if(CLOUD) setInterval(function(){ if(screen === "prof" && !$("cloudBox").hidden && $("cloudBox").open && document.visibilityState !== "hidden") cloudRefresh(); }, 10000);
 
 /* ---------- démarrage, avec reprise si la page est mise à jour pendant qu'elle est ouverte ---------- */
