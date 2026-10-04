@@ -2736,7 +2736,7 @@ $("endHome").addEventListener("click", function(){ G = null; saveG(); show("home
 
 /* ---------- comptes en ligne (site hébergé) : une classe, des élèves, un prof, les résultats en direct ---------- */
 /* ponytail: Firebase Realtime Database en REST, sans SDK ; code de classe = clé ; PIN haché côté client (brute-forçable : c'est un quiz, pas une banque). */
-var CLOUD = /github\.io$/i.test(location.hostname) || !!window.QCM_CLOUD_TEST;
+var CLOUD = /github\.io$|netlify\.app$/i.test(location.hostname) || !!window.QCM_CLOUD_TEST;
 var CLOUD_API = "https://qcm-biometrie-default-rtdb.firebaseio.com/classes/";
 var KEY_CLASS = "qcm-biometrie-classe-id-v1";
 function savedClassId(){ var v = lsGet(KEY_CLASS) || ""; return /^[A-Z2-9]{4,8}$/.test(v) ? v : ""; }
